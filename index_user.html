@@ -42,11 +42,11 @@
         user.innerHTML = msg.username;
         counter.innerHTML = msg.count.toLocaleString();
 
-        if (msg.winner) {
-          user.setAttribute('class', 'animated infinite pulse');
-          createWinnerFireworks();
-          socket.close();
-        }
+        // if (msg.winner) {
+        //   user.setAttribute('class', 'animated infinite pulse');
+        //   createWinnerFireworks();
+        //   socket.close();
+        // }
       }
       socket.onclose = function () {
         setTimeout(startWs(constructWsURI()), 5000);
