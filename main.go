@@ -95,6 +95,11 @@ type msg struct {
 	Winner   bool   `json:"winner"`
 }
 
+type u_msg struct {
+	Username string `json:"username"`
+	Count    int64  `json:"count"`
+}
+
 func httpLog(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -171,6 +176,13 @@ var (
 		unregister: make(chan *conn),
 	}
 
+	u = &hub{
+		conns:      make(map[*conn]bool),
+		broadcast:  make(chan []byte),
+		register:   make(chan *conn),
+		unregister: make(chan *conn),
+	}
+
 	pool *redis.Pool
 
 	count int64
@@ -204,13 +216,17 @@ func main() {
 	}
 
 	go h.run()
+	go u.run()
 
 	http.HandleFunc("/", serveRoot)
+	http.HandleFunc("/user", serveUser)
 	http.Handle("/static/",
 		http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))
 	http.HandleFunc("/yo", serveYo)
 	http.HandleFunc("/flips", getFlips)
 	http.HandleFunc("/connect", serveWs)
+	http.HandleFunc("/userconnect", serveUserWs)
+
 
 	log.Fatal(http.ListenAndServe(":"+port, httpLog(http.DefaultServeMux)))
 }
@@ -267,19 +283,37 @@ func serveRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	winningMsg, err := getMsg(conn, "winning_msg")
+
+	msg = lastMsg
+
+
+	tmpl, err := template.New("index.html").ParseFiles("./index.html")
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	if winningMsg != nil {
-		msg = winningMsg
-	} else {
-		msg = lastMsg
+	if err := tmpl.Execute(w, msg); err != nil {
+		log.Println(err)
 	}
+}
 
-	tmpl, err := template.New("index.html").ParseFiles("./index.html")
+func serveUser(w http.ResponseWriter, r *http.Request) {
+	conn := pool.Get()
+	defer conn.Close()
+
+	msg := &msg{}
+
+	msg.Username = r.URL.Query().Get("username")
+
+	count, err := redis.Int64(conn.Do("GET", msg.Username))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	msg.Count = count
+
+	tmpl, err := template.New("index_user.html").ParseFiles("./index_user.html")
 	if err != nil {
 		log.Println(err)
 		return
@@ -299,40 +333,43 @@ func serveYo(w http.ResponseWriter, r *http.Request) {
 	conn := pool.Get()
 	defer conn.Close()
 
+    // global flip
+	msg := &msg{}
+	msg.Username = r.URL.Query().Get("username")
+	
 	count, err := redis.Int64(conn.Do("GET", "count"))
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	msg := &msg{}
-
-	msg.Username = r.URL.Query().Get("username")
 	msg.Count = count
-
-	winningMsg, err := getMsg(conn, "winning_msg")
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	if count >= winnerThreshold && winningMsg == nil {
-		msg.Winner = true
-		msg.Count = winnerThreshold
-
-		if _, err := doWithObj(conn, "SET", "winning_msg", msg); err != nil {
-			log.Println(err)
-			return
-		}
-	}
 
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-
 	h.broadcast <- msgBytes
+
+    // broadcast with go routine user flip counts
+	u_msg := &u_msg{}
+	u_msg.Username = r.URL.Query().Get("username")
+	
+	u_count, u_err := redis.Int64(conn.Do("GET", u_msg.Username))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	u_msg.Count = u_count
+
+	u_msgBytes, u_err := json.Marshal(u_msg)
+	if u_err != nil {
+		log.Println(u_err)
+		return
+	}
+	u.broadcast <- u_msgBytes
+
 
 	if _, err := doWithObj(conn, "SET", "last_msg", msg); err != nil {
 		log.Println(err)
@@ -360,17 +397,22 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	winningMsg, err := getMsg(redisConn, "winning_msg")
+	c := &conn{send: make(chan []byte, 256), ws: ws}
+	h.register <- c
+	c.writePump()
+}
+
+func serveUserWs(w http.ResponseWriter, r *http.Request) {
+	redisConn := pool.Get()
+	defer redisConn.Close()
+
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	if winningMsg != nil { // don't maintain ws after contest finished
-		return
-	}
-
 	c := &conn{send: make(chan []byte, 256), ws: ws}
-	h.register <- c
+	u.register <- c
 	c.writePump()
 }
